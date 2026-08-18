@@ -1,0 +1,4 @@
+.env
+# Application logs
+logs/*.log
+logs/*.log.*

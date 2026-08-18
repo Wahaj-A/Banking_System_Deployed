@@ -1,0 +1,10 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "buildCommand": "cd Frontend && npm install && npm run build",
+  "outputDirectory": "Frontend/dist",
+  "functions": {
+    "api/**/*.py": {
+      "excludeFiles": "{**/__pycache__/**,**/*.pyc,Backend/logs/**,Backend/rag_test.py}"
+    }
+  }
+}
