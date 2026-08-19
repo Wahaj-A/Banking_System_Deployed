@@ -1,73 +1,218 @@
 """
 BANK LOGIC MODULE
---------------------
-Same Account / Transaction / Bank classes as simple_banking_oop_sqlite.py,
-with the console menu removed. This file has no print()/input() calls —
-it's pure logic, so it can be reused by the console app, the Streamlit
-app, or anything else that wants to talk to the same database.
+-----------------
+Database-backed banking logic.
+
+Database selection:
+- Local development: SQLite (banking.db)
+- Vercel/production: Neon PostgreSQL using DATABASE_URL
+
+The public classes and methods are kept compatible with the existing
+FastAPI application:
+    Auth
+    Account
+    Transaction
+    Bank
 """
 
-import sqlite3
-import random
 import hashlib
 import os
-from datetime import datetime
+import random
+import sqlite3
+from datetime import datetime, timezone
+
 from Backend.logger import logger
 
-if os.getenv("VERCEL"):
-    DB_FILE = "/tmp/banking.db"
+
+# ---------------------------------------------------------------------------
+# DATABASE CONFIGURATION
+# ---------------------------------------------------------------------------
+
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+if DATABASE_URL:
+    DATABASE_TYPE = "postgres"
 else:
+    DATABASE_TYPE = "sqlite"
+
     DB_FILE = os.path.join(
         os.path.dirname(os.path.dirname(__file__)),
-        "banking.db"
+        "banking.db",
     )
 
+
+# ---------------------------------------------------------------------------
+# CONNECTION
+# ---------------------------------------------------------------------------
+
 def get_connection():
+    """
+    Return a database connection.
+
+    If DATABASE_URL is configured, connect to Neon PostgreSQL.
+    Otherwise, use the local SQLite database.
+    """
+
+    if DATABASE_TYPE == "postgres":
+        try:
+            import psycopg
+            from psycopg.rows import dict_row
+
+            conn = psycopg.connect(
+                DATABASE_URL,
+                row_factory=dict_row,
+                connect_timeout=10,
+            )
+
+            return conn
+
+        except Exception:
+            logger.exception("DATABASE PostgreSQL connection failed")
+            raise
+
     conn = sqlite3.connect(DB_FILE)
     conn.row_factory = sqlite3.Row
     return conn
 
 
-def init_db():
-    conn = get_connection()
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS accounts (
-            account_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            account_number TEXT NOT NULL UNIQUE,
-            name TEXT NOT NULL,
-            balance REAL NOT NULL DEFAULT 0,
-            email TEXT 
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS transactions (
-            transaction_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            account_id INTEGER NOT NULL,
-            type TEXT NOT NULL,
-            amount REAL NOT NULL,
-            balance_after REAL NOT NULL,
-            timestamp TEXT NOT NULL,
-            FOREIGN KEY (account_id) REFERENCES accounts (account_id)
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            email TEXT NOT NULL UNIQUE,
-            password_hash TEXT NOT NULL,
-            salt TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        )
-    """)
-    conn.commit()
-    conn.close()
+def _execute(conn, query, params=()):
+    """
+    Execute SQL using the correct placeholder style.
 
+    SQLite uses:
+        ?
+
+    PostgreSQL uses:
+        %s
+    """
+
+    if DATABASE_TYPE == "postgres":
+        query = query.replace("?", "%s")
+
+    return conn.execute(query, params)
+
+
+# ---------------------------------------------------------------------------
+# DATABASE INITIALIZATION
+# ---------------------------------------------------------------------------
+
+def init_db():
+    """
+    Create the required tables if they do not already exist.
+    """
+
+    conn = get_connection()
+
+    try:
+        if DATABASE_TYPE == "postgres":
+
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS accounts (
+                    account_id BIGSERIAL PRIMARY KEY,
+                    account_number TEXT NOT NULL UNIQUE,
+                    name TEXT NOT NULL,
+                    balance DOUBLE PRECISION NOT NULL DEFAULT 0,
+                    email TEXT
+                )
+                """
+            )
+
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS transactions (
+                    transaction_id BIGSERIAL PRIMARY KEY,
+                    account_id BIGINT NOT NULL,
+                    type TEXT NOT NULL,
+                    amount DOUBLE PRECISION NOT NULL,
+                    balance_after DOUBLE PRECISION NOT NULL,
+                    timestamp TIMESTAMP NOT NULL,
+                    FOREIGN KEY (account_id)
+                        REFERENCES accounts(account_id)
+                        ON DELETE CASCADE
+                )
+                """
+            )
+
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id BIGSERIAL PRIMARY KEY,
+                    email TEXT NOT NULL UNIQUE,
+                    password_hash TEXT NOT NULL,
+                    salt TEXT NOT NULL,
+                    created_at TIMESTAMP NOT NULL
+                )
+                """
+            )
+
+        else:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS accounts (
+                    account_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_number TEXT NOT NULL UNIQUE,
+                    name TEXT NOT NULL,
+                    balance REAL NOT NULL DEFAULT 0,
+                    email TEXT
+                )
+                """
+            )
+
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS transactions (
+                    transaction_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_id INTEGER NOT NULL,
+                    type TEXT NOT NULL,
+                    amount REAL NOT NULL,
+                    balance_after REAL NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    FOREIGN KEY (account_id)
+                        REFERENCES accounts(account_id)
+                )
+                """
+            )
+
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    email TEXT NOT NULL UNIQUE,
+                    password_hash TEXT NOT NULL,
+                    salt TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+
+        conn.commit()
+
+        logger.info(
+            "DATABASE initialized successfully using %s",
+            DATABASE_TYPE,
+        )
+
+    except Exception:
+        conn.rollback()
+        logger.exception("DATABASE initialization failed")
+        raise
+
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# AUTHENTICATION
+# ---------------------------------------------------------------------------
 
 class Auth:
-    """Handles user signup/login. Passwords are never stored in plain text —
-    each password is combined with a random 'salt' and run through a hashing
-    function thousands of times (PBKDF2), which is deliberately slow to make
-    password-guessing attacks impractical, even if the database ever leaked."""
+    """
+    Handles user signup and login.
+
+    Passwords are never stored directly.
+    Each password is combined with a random salt and hashed using PBKDF2.
+    """
 
     def __init__(self):
         init_db()
@@ -77,68 +222,139 @@ class Auth:
             "sha256",
             password.encode("utf-8"),
             bytes.fromhex(salt),
-            100_000  # number of hashing rounds — higher = slower to crack
+            100_000,
         ).hex()
 
     def signup(self, email, password):
-        email = email.strip()
+        email = email.strip().lower()
+
         if not email or not password:
             raise ValueError("Email and password are required.")
+
         if len(password) < 4:
             raise ValueError("Password must be at least 4 characters.")
 
         conn = get_connection()
-        existing = conn.execute(
-            "SELECT 1 FROM users WHERE email = ?", (email,)
-        ).fetchone()
-        
-        if existing:
+
+        try:
+            existing = _execute(
+                conn,
+                "SELECT 1 FROM users WHERE email = ?",
+                (email,),
+            ).fetchone()
+
+            if existing:
+                raise ValueError("That email is already registered.")
+
+            salt = os.urandom(16).hex()
+            password_hash = self._hash_password(password, salt)
+
+            if DATABASE_TYPE == "postgres":
+                conn.execute(
+                    """
+                    INSERT INTO users
+                    (email, password_hash, salt, created_at)
+                    VALUES (%s, %s, %s, %s)
+                    """,
+                    (
+                        email,
+                        password_hash,
+                        salt,
+                        datetime.now(timezone.utc),
+                    ),
+                )
+            else:
+                _execute(
+                    conn,
+                    """
+                    INSERT INTO users
+                    (email, password_hash, salt, created_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        email,
+                        password_hash,
+                        salt,
+                        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    ),
+                )
+
+            conn.commit()
+
+            logger.info("AUTH signup completed")
+
+        except ValueError:
+            conn.rollback()
+            raise
+
+        except Exception:
+            conn.rollback()
+            logger.exception("AUTH signup failed")
+            raise
+
+        finally:
             conn.close()
-            raise ValueError("That email is already registered.")
-
-        salt = os.urandom(16).hex()
-        password_hash = self._hash_password(password, salt)
-
-        conn.execute(
-            "INSERT INTO users (email, password_hash, salt, created_at) VALUES (?, ?, ?, ?)",
-            (email, password_hash, salt, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-        )
-        conn.commit()
-        conn.close()
-        logger.info("AUTH signup completed")
 
     def login(self, email, password):
+        email = email.strip().lower()
+
         conn = get_connection()
-        row = conn.execute(
-            "SELECT * FROM users WHERE email = ?", (email.strip(),)
-        ).fetchone()
-        conn.close()
+
+        try:
+            row = _execute(
+                conn,
+                "SELECT * FROM users WHERE email = ?",
+                (email,),
+            ).fetchone()
+
+        finally:
+            conn.close()
 
         if row is None:
+            logger.warning("AUTH invalid email")
             raise ValueError("Invalid email or password.")
 
-        candidate_hash = self._hash_password(password, row["salt"])
+        candidate_hash = self._hash_password(
+            password,
+            row["salt"],
+        )
+
         if candidate_hash != row["password_hash"]:
             logger.warning("AUTH invalid credentials")
             raise ValueError("Invalid email or password.")
 
         logger.info("AUTH credentials verified")
+
         return row["email"]
 
 
+# ---------------------------------------------------------------------------
+# ACCOUNT
+# ---------------------------------------------------------------------------
+
 class Account:
+
     def __init__(self, row):
         self.account_id = row["account_id"]
         self.account_number = row["account_number"]
         self.name = row["name"]
         self.balance = row["balance"]
-        self.email = row["email"]  # <--- Change this line!
+        self.email = row["email"]
 
     def __str__(self):
-        return (f"ID {self.account_id} | Account #{self.account_number}: "
-                f"{self.name} — balance: {self.balance}")
+        return (
+            f"ID {self.account_id} | "
+            f"Account #{self.account_number}: "
+            f"{self.name} — balance: {self.balance}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# TRANSACTION
+# ---------------------------------------------------------------------------
 
 class Transaction:
+
     def __init__(self, row):
         self.tx_type = row["type"]
         self.amount = row["amount"]
@@ -146,157 +362,595 @@ class Transaction:
         self.timestamp = row["timestamp"]
 
     def __str__(self):
-        return f"[{self.timestamp}] {self.tx_type.upper():<10} {self.amount:<10} (balance after: {self.balance_after})"
+        return (
+            f"[{self.timestamp}] "
+            f"{self.tx_type.upper():<10} "
+            f"{self.amount:<10} "
+            f"(balance after: {self.balance_after})"
+        )
 
+
+# ---------------------------------------------------------------------------
+# BANK
+# ---------------------------------------------------------------------------
 
 class Bank:
+
     def __init__(self, name="My Bank"):
         self.name = name
         init_db()
 
+    # -----------------------------------------------------------------------
+    # ACCOUNT NUMBER
+    # -----------------------------------------------------------------------
+
     def _generate_account_number(self, conn):
+
         while True:
-            candidate = str(random.randint(10_000, 9_999_999))
-            exists = conn.execute(
-                "SELECT 1 FROM accounts WHERE account_number = ?", (candidate,)
+
+            candidate = str(
+                random.randint(100000, 999999)
+            )
+
+            exists = _execute(
+                conn,
+                "SELECT 1 FROM accounts WHERE account_number = ?",
+                (candidate,),
             ).fetchone()
+
             if not exists:
                 return candidate
 
-    def create_account(self, name, starting_balance=0):
+    # -----------------------------------------------------------------------
+    # CREATE ACCOUNT
+    # -----------------------------------------------------------------------
+
+    def create_account(
+        self,
+        name,
+        starting_balance=0,
+        email="",
+    ):
+
+        if not name or not str(name).strip():
+            raise ValueError("Account name is required.")
+
+        if starting_balance < 0:
+            raise ValueError("Starting balance cannot be negative.")
+
         conn = get_connection()
-        account_number = self._generate_account_number(conn)
 
-        cursor = conn.execute(
-            "INSERT INTO accounts (account_number, name, balance) VALUES (?, ?, ?)",
-            (account_number, name, starting_balance)
-        )
-        account_id = cursor.lastrowid
-        conn.commit()
-        conn.close()
+        try:
 
-        if starting_balance > 0:
-            self._log_transaction(account_id, "deposit", starting_balance, starting_balance)
+            account_number = self._generate_account_number(conn)
 
-        logger.info("BANK account created")
-        return self.find_account(account_id)
+            if DATABASE_TYPE == "postgres":
 
-    def find_account(self, account_id):
-        conn = get_connection()
-        row = conn.execute(
-            "SELECT * FROM accounts WHERE account_id = ?", (account_id,)
-        ).fetchone()
-        conn.close()
-        return Account(row) if row else None
+                row = conn.execute(
+                    """
+                    INSERT INTO accounts
+                    (account_number, name, balance, email)
+                    VALUES (%s, %s, %s, %s)
+                    RETURNING account_id
+                    """,
+                    (
+                        account_number,
+                        str(name).strip(),
+                        starting_balance,
+                        email.strip().lower() if email else "",
+                    ),
+                ).fetchone()
 
-    # 1. Update find_account to search by the account_number column
+                account_id = row["account_id"]
+
+            else:
+
+                cursor = _execute(
+                    conn,
+                    """
+                    INSERT INTO accounts
+                    (account_number, name, balance, email)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        account_number,
+                        str(name).strip(),
+                        starting_balance,
+                        email.strip().lower() if email else "",
+                    ),
+                )
+
+                account_id = cursor.lastrowid
+
+            conn.commit()
+
+            if starting_balance > 0:
+                self._log_transaction(
+                    account_id,
+                    "Deposit",
+                    starting_balance,
+                    starting_balance,
+                )
+
+            logger.info("BANK account created")
+
+            return self.find_account(account_number)
+
+        except Exception:
+            conn.rollback()
+            logger.exception("BANK account creation failed")
+            raise
+
+        finally:
+            conn.close()
+
+    # -----------------------------------------------------------------------
+    # FIND ACCOUNT
+    # -----------------------------------------------------------------------
+
     def find_account(self, account_identifier):
-        conn = get_connection()
-        row = conn.execute(
-            "SELECT * FROM accounts WHERE account_number = ?", (str(account_identifier),)
-        ).fetchone()
-        conn.close()
-        return Account(row) if row else None
 
-    # 2. Update create_account so it fetches the new account by its number
-    def create_account(self, name: str, starting_balance: float, email: str = ""):
-        import random
-        account_number = str(random.randint(100000, 999999))
-        
         conn = get_connection()
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT INTO accounts (account_number, name, balance, email) VALUES (?, ?, ?, ?)",
-            (account_number, name, starting_balance, email)
-        )
-        conn.commit()
-        conn.close()
-        
-        # 🚨 Changed this line so it uses the account_number!
-        return self.find_account(account_number)
+
+        try:
+
+            row = _execute(
+                conn,
+                """
+                SELECT *
+                FROM accounts
+                WHERE account_number = ?
+                   OR CAST(account_id AS TEXT) = ?
+                LIMIT 1
+                """,
+                (
+                    str(account_identifier),
+                    str(account_identifier),
+                ),
+            ).fetchone()
+
+            return Account(row) if row else None
+
+        finally:
+            conn.close()
+
+    # -----------------------------------------------------------------------
+    # INTERNAL TRANSACTION LOGGER
+    # -----------------------------------------------------------------------
+
+    def _log_transaction(
+        self,
+        account_id,
+        tx_type,
+        amount,
+        balance_after,
+    ):
+
+        conn = get_connection()
+
+        try:
+
+            if DATABASE_TYPE == "postgres":
+
+                conn.execute(
+                    """
+                    INSERT INTO transactions
+                    (account_id, type, amount, balance_after, timestamp)
+                    VALUES (%s, %s, %s, %s, %s)
+                    """,
+                    (
+                        account_id,
+                        tx_type,
+                        amount,
+                        balance_after,
+                        datetime.now(timezone.utc),
+                    ),
+                )
+
+            else:
+
+                _execute(
+                    conn,
+                    """
+                    INSERT INTO transactions
+                    (account_id, type, amount, balance_after, timestamp)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        account_id,
+                        tx_type,
+                        amount,
+                        balance_after,
+                        datetime.now().strftime(
+                            "%Y-%m-%d %H:%M:%S"
+                        ),
+                    ),
+                )
+
+            conn.commit()
+
+        except Exception:
+            conn.rollback()
+            logger.exception("BANK transaction logging failed")
+            raise
+
+        finally:
+            conn.close()
+
+    # -----------------------------------------------------------------------
+    # DEPOSIT
+    # -----------------------------------------------------------------------
 
     def deposit(self, account_identifier, amount: float):
+
+        if amount <= 0:
+            raise ValueError("Deposit amount must be greater than zero.")
+
         acc = self.find_account(account_identifier)
+
         if not acc:
-            raise ValueError("Account not found")
+            raise ValueError("Account not found.")
 
         conn = get_connection()
-        # 1. Update the account balance
-        conn.execute(
-            "UPDATE accounts SET balance = balance + ? WHERE account_id = ?",
-            (amount, acc.account_id)
-        )
-        
-        # 2. Log the transaction (Matching your exact schema)
-        new_balance = acc.balance + amount
-        conn.execute(
-            "INSERT INTO transactions (account_id, type, amount, balance_after, timestamp) VALUES (?, ?, ?, ?, datetime('now'))",
-            (acc.account_id, "Deposit", amount, new_balance)
-        )
-        
-        conn.commit()
-        conn.close()
-        logger.info("BANK deposit completed")
-        return self.find_account(account_identifier)
+
+        try:
+
+            new_balance = float(acc.balance) + float(amount)
+
+            _execute(
+                conn,
+                """
+                UPDATE accounts
+                SET balance = balance + ?
+                WHERE account_id = ?
+                """,
+                (
+                    amount,
+                    acc.account_id,
+                ),
+            )
+
+            if DATABASE_TYPE == "postgres":
+
+                conn.execute(
+                    """
+                    INSERT INTO transactions
+                    (account_id, type, amount, balance_after, timestamp)
+                    VALUES (%s, %s, %s, %s, %s)
+                    """,
+                    (
+                        acc.account_id,
+                        "Deposit",
+                        amount,
+                        new_balance,
+                        datetime.now(timezone.utc),
+                    ),
+                )
+
+            else:
+
+                _execute(
+                    conn,
+                    """
+                    INSERT INTO transactions
+                    (account_id, type, amount, balance_after, timestamp)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        acc.account_id,
+                        "Deposit",
+                        amount,
+                        new_balance,
+                        datetime.now().strftime(
+                            "%Y-%m-%d %H:%M:%S"
+                        ),
+                    ),
+                )
+
+            conn.commit()
+
+            logger.info("BANK deposit completed")
+
+            return self.find_account(account_identifier)
+
+        except Exception:
+            conn.rollback()
+            logger.exception("BANK deposit failed")
+            raise
+
+        finally:
+            conn.close()
+
+    # -----------------------------------------------------------------------
+    # WITHDRAW
+    # -----------------------------------------------------------------------
 
     def withdraw(self, account_identifier, amount: float):
+
+        if amount <= 0:
+            raise ValueError("Withdrawal amount must be greater than zero.")
+
         acc = self.find_account(account_identifier)
-        if not acc or acc.balance < amount:
-            raise ValueError("Insufficient funds or account not found")
-        
+
+        if not acc:
+            raise ValueError("Account not found.")
+
+        if float(acc.balance) < float(amount):
+            raise ValueError("Insufficient funds.")
+
         conn = get_connection()
-        # 1. Update the account balance
-        conn.execute(
-            "UPDATE accounts SET balance = balance - ? WHERE account_id = ?",
-            (amount, acc.account_id)
-        )
-        
-        # 2. Log the transaction (Matching your exact schema)
-        new_balance = acc.balance - amount
-        conn.execute(
-            "INSERT INTO transactions (account_id, type, amount, balance_after, timestamp) VALUES (?, ?, ?, ?, datetime('now'))",
-            (acc.account_id, "Withdraw", amount, new_balance)
-        )
-        
-        conn.commit()
-        conn.close()
-        return self.find_account(account_identifier)
-    
-    # 7. Update transfer (if you have this function in bank_logic.py)
-    def transfer(self, from_account_identifier, to_account_identifier, amount: float):
+
+        try:
+
+            new_balance = float(acc.balance) - float(amount)
+
+            _execute(
+                conn,
+                """
+                UPDATE accounts
+                SET balance = balance - ?
+                WHERE account_id = ?
+                """,
+                (
+                    amount,
+                    acc.account_id,
+                ),
+            )
+
+            if DATABASE_TYPE == "postgres":
+
+                conn.execute(
+                    """
+                    INSERT INTO transactions
+                    (account_id, type, amount, balance_after, timestamp)
+                    VALUES (%s, %s, %s, %s, %s)
+                    """,
+                    (
+                        acc.account_id,
+                        "Withdraw",
+                        amount,
+                        new_balance,
+                        datetime.now(timezone.utc),
+                    ),
+                )
+
+            else:
+
+                _execute(
+                    conn,
+                    """
+                    INSERT INTO transactions
+                    (account_id, type, amount, balance_after, timestamp)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        acc.account_id,
+                        "Withdraw",
+                        amount,
+                        new_balance,
+                        datetime.now().strftime(
+                            "%Y-%m-%d %H:%M:%S"
+                        ),
+                    ),
+                )
+
+            conn.commit()
+
+            logger.info("BANK withdrawal completed")
+
+            return self.find_account(account_identifier)
+
+        except Exception:
+            conn.rollback()
+            logger.exception("BANK withdrawal failed")
+            raise
+
+        finally:
+            conn.close()
+
+    # -----------------------------------------------------------------------
+    # TRANSFER
+    # -----------------------------------------------------------------------
+
+    def transfer(
+        self,
+        from_account_identifier,
+        to_account_identifier,
+        amount: float,
+    ):
+
+        if amount <= 0:
+            raise ValueError("Transfer amount must be greater than zero.")
+
         sender = self.find_account(from_account_identifier)
         receiver = self.find_account(to_account_identifier)
-        
-        if not sender or sender.balance < amount:
-            raise ValueError("Insufficient funds in sender account or account not found")
+
+        if not sender:
+            raise ValueError("Sender account not found.")
+
         if not receiver:
-            raise ValueError("Receiver account not found")
-            
+            raise ValueError("Receiver account not found.")
+
+        if sender.account_id == receiver.account_id:
+            raise ValueError("Cannot transfer to the same account.")
+
+        if float(sender.balance) < float(amount):
+            raise ValueError("Insufficient funds in sender account.")
+
         conn = get_connection()
-        conn.execute("UPDATE accounts SET balance = balance - ? WHERE account_number = ?", (amount, str(from_account_identifier)))
-        conn.execute("UPDATE accounts SET balance = balance + ? WHERE account_number = ?", (amount, str(to_account_identifier)))
-        conn.commit()
-        conn.close()
-        
-        return self.find_account(from_account_identifier), self.find_account(to_account_identifier)
+
+        try:
+
+            sender_new_balance = (
+                float(sender.balance) - float(amount)
+            )
+
+            receiver_new_balance = (
+                float(receiver.balance) + float(amount)
+            )
+
+            _execute(
+                conn,
+                """
+                UPDATE accounts
+                SET balance = balance - ?
+                WHERE account_id = ?
+                """,
+                (
+                    amount,
+                    sender.account_id,
+                ),
+            )
+
+            _execute(
+                conn,
+                """
+                UPDATE accounts
+                SET balance = balance + ?
+                WHERE account_id = ?
+                """,
+                (
+                    amount,
+                    receiver.account_id,
+                ),
+            )
+
+            if DATABASE_TYPE == "postgres":
+
+                now = datetime.now(timezone.utc)
+
+                conn.execute(
+                    """
+                    INSERT INTO transactions
+                    (account_id, type, amount, balance_after, timestamp)
+                    VALUES (%s, %s, %s, %s, %s)
+                    """,
+                    (
+                        sender.account_id,
+                        "Transfer Out",
+                        amount,
+                        sender_new_balance,
+                        now,
+                    ),
+                )
+
+                conn.execute(
+                    """
+                    INSERT INTO transactions
+                    (account_id, type, amount, balance_after, timestamp)
+                    VALUES (%s, %s, %s, %s, %s)
+                    """,
+                    (
+                        receiver.account_id,
+                        "Transfer In",
+                        amount,
+                        receiver_new_balance,
+                        now,
+                    ),
+                )
+
+            else:
+
+                now = datetime.now().strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                )
+
+                _execute(
+                    conn,
+                    """
+                    INSERT INTO transactions
+                    (account_id, type, amount, balance_after, timestamp)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        sender.account_id,
+                        "Transfer Out",
+                        amount,
+                        sender_new_balance,
+                        now,
+                    ),
+                )
+
+                _execute(
+                    conn,
+                    """
+                    INSERT INTO transactions
+                    (account_id, type, amount, balance_after, timestamp)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        receiver.account_id,
+                        "Transfer In",
+                        amount,
+                        receiver_new_balance,
+                        now,
+                    ),
+                )
+
+            conn.commit()
+
+            logger.info("BANK transfer completed")
+
+            return (
+                self.find_account(from_account_identifier),
+                self.find_account(to_account_identifier),
+            )
+
+        except Exception:
+            conn.rollback()
+            logger.exception("BANK transfer failed")
+            raise
+
+        finally:
+            conn.close()
+
+    # -----------------------------------------------------------------------
+    # LIST ACCOUNTS
+    # -----------------------------------------------------------------------
+
     def list_accounts(self):
+
         conn = get_connection()
-        rows = conn.execute("SELECT * FROM accounts").fetchall()
-        conn.close()
-        return [Account(row) for row in rows]
+
+        try:
+
+            rows = conn.execute(
+                "SELECT * FROM accounts ORDER BY account_id"
+            ).fetchall()
+
+            return [Account(row) for row in rows]
+
+        finally:
+            conn.close()
+
+    # -----------------------------------------------------------------------
+    # TRANSACTION HISTORY
+    # -----------------------------------------------------------------------
 
     def get_transaction_history(self, account_identifier):
+
         acc = self.find_account(account_identifier)
+
         if not acc:
             return []
-            
+
         conn = get_connection()
-        # Fetching based on your schema's account_id and transaction_id
-        rows = conn.execute(
-            "SELECT * FROM transactions WHERE account_id = ? ORDER BY transaction_id DESC",
-            (acc.account_id,)
-        ).fetchall()
-        conn.close()
-        
-        # Assuming you return standard dictionaries for FastAPI to parse
-        return [dict(row) for row in rows]
+
+        try:
+
+            rows = _execute(
+                conn,
+                """
+                SELECT *
+                FROM transactions
+                WHERE account_id = ?
+                ORDER BY transaction_id DESC
+                """,
+                (acc.account_id,),
+            ).fetchall()
+
+            return [dict(row) for row in rows]
+
+        finally:
+            conn.close()
+
