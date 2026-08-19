@@ -1,7 +1,5 @@
 // Cleanly ensure base URL without double slashes or trailing /api
-const BASE_URL = (import.meta.env.VITE_API_URL || (import.meta.env.DEV ? 'http://127.0.0.1:8000' : window.location.origin)).replace(/\/+$/, '')
-const API_URL = BASE_URL.endsWith('/api') ? BASE_URL : `${BASE_URL}/api`
-
+const API_URL = '/api'
 async function request(path, options = {}) {
   const res = await fetch(`${API_URL}${path}`, {
     headers: { 'Content-Type': 'application/json' },
