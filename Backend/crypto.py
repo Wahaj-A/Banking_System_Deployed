@@ -1,4 +1,3 @@
-```python
 """Live cryptocurrency service for the five supported assets.
 
 Uses CoinGecko's public market endpoint instead of Binance. This avoids
