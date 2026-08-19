@@ -1,70 +1,139 @@
 """Live cryptocurrency service for the five supported assets.
 
-Uses Binance's public 24-hour ticker endpoint. No crypto API key is required.
+Uses CoinGecko's public market endpoint instead of Binance. This avoids
+Binance region/IP restrictions that can return HTTP 451 from Vercel.
+
+Optional Vercel environment variable:
+    COINGECKO_API_KEY
+
+If a CoinGecko Demo API key is configured, it is sent as the
+``x-cg-demo-api-key`` header. No changes are required elsewhere in the app.
 """
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+from urllib.error import HTTPError
 import json
+import os
+
 from Backend.logger import logger
 
 
-
 SUPPORTED_CRYPTO = {
-    "Bitcoin": {"symbol": "BTCUSDT", "ticker": "BTC", "name": "Bitcoin"},
-    "Ethereum": {"symbol": "ETHUSDT", "ticker": "ETH", "name": "Ethereum"},
-    "BNB": {"symbol": "BNBUSDT", "ticker": "BNB", "name": "BNB"},
-    "Solana": {"symbol": "SOLUSDT", "ticker": "SOL", "name": "Solana"},
-    "XRP": {"symbol": "XRPUSDT", "ticker": "XRP", "name": "XRP"},
+    "Bitcoin": {"id": "bitcoin", "ticker": "BTC", "name": "Bitcoin"},
+    "Ethereum": {"id": "ethereum", "ticker": "ETH", "name": "Ethereum"},
+    "BNB": {"id": "binancecoin", "ticker": "BNB", "name": "BNB"},
+    "Solana": {"id": "solana", "ticker": "SOL", "name": "Solana"},
+    "XRP": {"id": "ripple", "ticker": "XRP", "name": "XRP"},
 }
 
 
 def _normalize_crypto(asset: str) -> str:
     if not asset:
         raise ValueError("Cryptocurrency is required.")
+
     value = asset.strip().lower()
     aliases = {
-        "btc": "Bitcoin", "bitcoin": "Bitcoin",
-        "eth": "Ethereum", "ethereum": "Ethereum",
-        "bnb": "BNB", "binance coin": "BNB",
-        "sol": "Solana", "solana": "Solana",
-        "xrp": "XRP", "ripple": "XRP",
+        "btc": "Bitcoin",
+        "bitcoin": "Bitcoin",
+        "eth": "Ethereum",
+        "ethereum": "Ethereum",
+        "bnb": "BNB",
+        "binance coin": "BNB",
+        "sol": "Solana",
+        "solana": "Solana",
+        "xrp": "XRP",
+        "ripple": "XRP",
     }
+
     if value in aliases:
         return aliases[value]
+
     raise ValueError(
         "Unsupported cryptocurrency. Crypto data is available only for "
         "Bitcoin, Ethereum, BNB, Solana, and XRP."
     )
 
 
-def _fetch_asset(asset: str) -> dict:
-    asset = _normalize_crypto(asset)
-    config = SUPPORTED_CRYPTO[asset]
-    params = urlencode({"symbol": config["symbol"]})
-    url = f"https://api.binance.com/api/v3/ticker/24hr?{params}"
-    request = Request(url, headers={"User-Agent": "Apex-Capital-Bank-Crypto/1.0"})
+def _request_markets() -> list[dict]:
+    """Fetch all supported assets in one CoinGecko request."""
+    ids = ",".join(config["id"] for config in SUPPORTED_CRYPTO.values())
+    params = urlencode(
+        {
+            "vs_currency": "usd",
+            "ids": ids,
+            "price_change_percentage": "24h",
+        }
+    )
+    url = f"https://api.coingecko.com/api/v3/coins/markets?{params}"
+
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "Apex-Capital-Bank-Crypto/1.0",
+    }
+
+    api_key = os.getenv("COINGECKO_API_KEY")
+    if api_key:
+        headers["x-cg-demo-api-key"] = api_key
+
+    request = Request(url, headers=headers)
 
     try:
         with urlopen(request, timeout=12) as response:
             payload = json.loads(response.read().decode("utf-8"))
-        logger.info("CRYPTO provider response received successfully")
+
+        if not isinstance(payload, list):
+            raise RuntimeError("CoinGecko returned an unexpected response.")
+
+        logger.info("CRYPTO provider response received successfully from CoinGecko")
+        return payload
+
+    except HTTPError as exc:
+        if exc.code in (401, 403):
+            raise RuntimeError(
+                "CoinGecko rejected the request. Add a valid COINGECKO_API_KEY "
+                "to Vercel Environment Variables."
+            ) from exc
+        if exc.code == 429:
+            raise RuntimeError(
+                "CoinGecko rate limit reached. Please try again shortly."
+            ) from exc
+
+        raise RuntimeError(
+            f"CoinGecko request failed with HTTP {exc.code}."
+        ) from exc
+
     except Exception as exc:
         logger.exception("CRYPTO provider request failed")
-        raise RuntimeError(f"Crypto provider request failed for {asset}: {exc}") from exc
+        raise RuntimeError(f"Crypto provider request failed: {exc}") from exc
+
+
+def _build_market_map() -> dict[str, dict]:
+    return {item.get("id"): item for item in _request_markets()}
+
+
+def _fetch_asset(asset: str, market_map: dict[str, dict] | None = None) -> dict:
+    asset = _normalize_crypto(asset)
+    config = SUPPORTED_CRYPTO[asset]
+
+    data = (market_map or _build_market_map()).get(config["id"])
+    if not data:
+        raise RuntimeError(f"CoinGecko returned no market data for {asset}.")
 
     return {
         "name": config["name"],
         "symbol": config["ticker"],
-        "pair": config["symbol"],
-        "price_usd": float(payload.get("lastPrice", 0)),
-        "price_change_24h_percent": float(payload.get("priceChangePercent", 0)),
-        "high_24h_usd": float(payload.get("highPrice", 0)),
-        "low_24h_usd": float(payload.get("lowPrice", 0)),
-        "volume_24h": float(payload.get("volume", 0)),
-        "quote_volume_24h_usd": float(payload.get("quoteVolume", 0)),
-        "updated_at": int(payload.get("closeTime", 0)),
-        "source": "Binance",
+        "pair": f"{config['ticker']}USD",
+        "price_usd": float(data.get("current_price") or 0),
+        "price_change_24h_percent": float(
+            data.get("price_change_percentage_24h") or 0
+        ),
+        "high_24h_usd": float(data.get("high_24h") or 0),
+        "low_24h_usd": float(data.get("low_24h") or 0),
+        "volume_24h": float(data.get("total_volume") or 0),
+        "quote_volume_24h_usd": float(data.get("total_volume") or 0),
+        "updated_at": int(data.get("last_updated") or 0),
+        "source": "CoinGecko",
     }
 
 
@@ -75,11 +144,8 @@ def get_crypto(asset: str) -> dict:
 
 def get_all_crypto() -> list[dict]:
     """Get live market data for all five supported cryptocurrencies."""
-    results = []
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        futures = {executor.submit(_fetch_asset, asset): asset for asset in SUPPORTED_CRYPTO}
-        for future in as_completed(futures):
-            results.append(future.result())
+    market_map = _build_market_map()
+    results = [_fetch_asset(asset, market_map) for asset in SUPPORTED_CRYPTO]
 
     order = list(SUPPORTED_CRYPTO)
     return sorted(results, key=lambda item: order.index(item["name"]))
