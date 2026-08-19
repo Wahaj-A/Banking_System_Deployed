@@ -1,3 +1,4 @@
+```python
 """Live cryptocurrency service for the five supported assets.
 
 Uses CoinGecko's public market endpoint instead of Binance. This avoids
@@ -9,6 +10,8 @@ Optional Vercel environment variable:
 If a CoinGecko Demo API key is configured, it is sent as the
 ``x-cg-demo-api-key`` header. No changes are required elsewhere in the app.
 """
+
+from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -33,6 +36,7 @@ def _normalize_crypto(asset: str) -> str:
         raise ValueError("Cryptocurrency is required.")
 
     value = asset.strip().lower()
+
     aliases = {
         "btc": "Bitcoin",
         "bitcoin": "Bitcoin",
@@ -57,7 +61,11 @@ def _normalize_crypto(asset: str) -> str:
 
 def _request_markets() -> list[dict]:
     """Fetch all supported assets in one CoinGecko request."""
-    ids = ",".join(config["id"] for config in SUPPORTED_CRYPTO.values())
+
+    ids = ",".join(
+        config["id"] for config in SUPPORTED_CRYPTO.values()
+    )
+
     params = urlencode(
         {
             "vs_currency": "usd",
@@ -65,7 +73,11 @@ def _request_markets() -> list[dict]:
             "price_change_percentage": "24h",
         }
     )
-    url = f"https://api.coingecko.com/api/v3/coins/markets?{params}"
+
+    url = (
+        "https://api.coingecko.com/api/v3/coins/markets?"
+        f"{params}"
+    )
 
     headers = {
         "Accept": "application/json",
@@ -73,6 +85,7 @@ def _request_markets() -> list[dict]:
     }
 
     api_key = os.getenv("COINGECKO_API_KEY")
+
     if api_key:
         headers["x-cg-demo-api-key"] = api_key
 
@@ -80,20 +93,29 @@ def _request_markets() -> list[dict]:
 
     try:
         with urlopen(request, timeout=12) as response:
-            payload = json.loads(response.read().decode("utf-8"))
+            payload = json.loads(
+                response.read().decode("utf-8")
+            )
 
         if not isinstance(payload, list):
-            raise RuntimeError("CoinGecko returned an unexpected response.")
+            raise RuntimeError(
+                "CoinGecko returned an unexpected response."
+            )
 
-        logger.info("CRYPTO provider response received successfully from CoinGecko")
+        logger.info(
+            "CRYPTO provider response received successfully from CoinGecko"
+        )
+
         return payload
 
     except HTTPError as exc:
+
         if exc.code in (401, 403):
             raise RuntimeError(
-                "CoinGecko rejected the request. Add a valid COINGECKO_API_KEY "
-                "to Vercel Environment Variables."
+                "CoinGecko rejected the request. Add a valid "
+                "COINGECKO_API_KEY to Vercel Environment Variables."
             ) from exc
+
         if exc.code == 429:
             raise RuntimeError(
                 "CoinGecko rate limit reached. Please try again shortly."
@@ -105,34 +127,101 @@ def _request_markets() -> list[dict]:
 
     except Exception as exc:
         logger.exception("CRYPTO provider request failed")
-        raise RuntimeError(f"Crypto provider request failed: {exc}") from exc
+
+        raise RuntimeError(
+            f"Crypto provider request failed: {exc}"
+        ) from exc
 
 
 def _build_market_map() -> dict[str, dict]:
-    return {item.get("id"): item for item in _request_markets()}
+    return {
+        item.get("id"): item
+        for item in _request_markets()
+    }
 
 
-def _fetch_asset(asset: str, market_map: dict[str, dict] | None = None) -> dict:
+def _parse_timestamp(value) -> int:
+    """Convert CoinGecko timestamp to Unix milliseconds.
+
+    CoinGecko returns last_updated in ISO 8601 format, for example:
+    2026-08-19T07:44:30.000Z
+
+    The frontend expects a numeric Unix timestamp in milliseconds.
+    """
+
+    if not value:
+        return 0
+
+    # Already numeric
+    if isinstance(value, (int, float)):
+        return int(value)
+
+    try:
+        timestamp = datetime.fromisoformat(
+            str(value).replace("Z", "+00:00")
+        )
+
+        return int(timestamp.timestamp() * 1000)
+
+    except (ValueError, TypeError, OverflowError):
+        logger.warning(
+            "Unable to parse crypto timestamp: %s",
+            value,
+        )
+
+        return 0
+
+
+def _fetch_asset(
+    asset: str,
+    market_map: dict[str, dict] | None = None,
+) -> dict:
     asset = _normalize_crypto(asset)
+
     config = SUPPORTED_CRYPTO[asset]
 
-    data = (market_map or _build_market_map()).get(config["id"])
+    data = (
+        market_map or _build_market_map()
+    ).get(config["id"])
+
     if not data:
-        raise RuntimeError(f"CoinGecko returned no market data for {asset}.")
+        raise RuntimeError(
+            f"CoinGecko returned no market data for {asset}."
+        )
 
     return {
         "name": config["name"],
         "symbol": config["ticker"],
         "pair": f"{config['ticker']}USD",
-        "price_usd": float(data.get("current_price") or 0),
+
+        "price_usd": float(
+            data.get("current_price") or 0
+        ),
+
         "price_change_24h_percent": float(
             data.get("price_change_percentage_24h") or 0
         ),
-        "high_24h_usd": float(data.get("high_24h") or 0),
-        "low_24h_usd": float(data.get("low_24h") or 0),
-        "volume_24h": float(data.get("total_volume") or 0),
-        "quote_volume_24h_usd": float(data.get("total_volume") or 0),
-        "updated_at": int(data.get("last_updated") or 0),
+
+        "high_24h_usd": float(
+            data.get("high_24h") or 0
+        ),
+
+        "low_24h_usd": float(
+            data.get("low_24h") or 0
+        ),
+
+        "volume_24h": float(
+            data.get("total_volume") or 0
+        ),
+
+        "quote_volume_24h_usd": float(
+            data.get("total_volume") or 0
+        ),
+
+        "updated_at": _parse_timestamp(
+            data.get("last_updated")
+        ),
+
         "source": "CoinGecko",
     }
 
@@ -144,8 +233,17 @@ def get_crypto(asset: str) -> dict:
 
 def get_all_crypto() -> list[dict]:
     """Get live market data for all five supported cryptocurrencies."""
+
     market_map = _build_market_map()
-    results = [_fetch_asset(asset, market_map) for asset in SUPPORTED_CRYPTO]
+
+    results = [
+        _fetch_asset(asset, market_map)
+        for asset in SUPPORTED_CRYPTO
+    ]
 
     order = list(SUPPORTED_CRYPTO)
-    return sorted(results, key=lambda item: order.index(item["name"]))
+
+    return sorted(
+        results,
+        key=lambda item: order.index(item["name"]),
+    )
